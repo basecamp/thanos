@@ -396,6 +396,146 @@ func TestDownsampleNativeHistograms(t *testing.T) {
 
 }
 
+// TestDownsampleExponentialHistogramCounterReset verifies reset detection when
+// a populated bucket disappears without reducing the total count. The
+// aggregator must apply reset semantics regardless of the counter reset hint,
+// otherwise the emitted cumulative counter regresses.
+func TestDownsampleExponentialHistogramCounterReset(t *testing.T) {
+	const step = 60000
+	const start = int64(1688526000000)
+
+	expSample := func(ts int64, spans []histogram.Span, buckets []float64, sum float64, hint histogram.CounterResetHint) sample {
+		var count float64
+		for _, b := range buckets {
+			count += b
+		}
+		return sample{
+			t: ts,
+			fh: &histogram.FloatHistogram{
+				Schema:           3,
+				ZeroThreshold:    2.938735877055719e-39,
+				Count:            count,
+				Sum:              sum,
+				CounterResetHint: hint,
+				PositiveSpans:    spans,
+				PositiveBuckets:  buckets,
+			},
+		}
+	}
+
+	// Incarnation A holds populated buckets -58 and -55 with interior zeros.
+	// Incarnation B holds -65 and -58: the same total count, but bucket -55 is
+	// gone.
+	spansA := []histogram.Span{{Offset: -58, Length: 4}}
+	bucketsA := []float64{1, 0, 0, 1}
+	spansB := []histogram.Span{{Offset: -65, Length: 1}, {Offset: 6, Length: 1}}
+	bucketsB := []float64{1, 1}
+
+	for _, tcase := range []struct {
+		name           string
+		transitionHint histogram.CounterResetHint
+	}{
+		{name: "unknown hint at transition", transitionHint: histogram.UnknownCounterReset},
+		{name: "not counter reset hint at transition", transitionHint: histogram.NotCounterReset},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			var data []sample
+			for i := 0; i < 10; i++ {
+				hint := histogram.NotCounterReset
+				if i == 0 {
+					hint = histogram.UnknownCounterReset
+				}
+				if i < 5 {
+					data = append(data, expSample(start+int64(i)*step, spansA, bucketsA, 0.0146, hint))
+				} else {
+					if i == 5 {
+						hint = tcase.transitionHint
+					}
+					data = append(data, expSample(start+int64(i)*step, spansB, bucketsB, 0.0095, hint))
+				}
+			}
+
+			chks, err := DownsampleRaw(data, ResLevel1)
+			testutil.Ok(t, err)
+			testutil.Equals(t, 1, len(chks))
+
+			counterSamples := expandAggrChunk(t, chks[0], AggrCounter)
+			testutil.Assert(t, len(counterSamples) >= 2, "expected at least two counter windows")
+
+			// The reset must be absorbed as reset semantics: the counter jumps
+			// by the full value of the new incarnation instead of regressing.
+			last := counterSamples[len(counterSamples)-1].fh
+			testutil.Equals(t, float64(4), last.Count)
+			for _, b := range last.PositiveBuckets {
+				testutil.Assert(t, b >= 0, "cumulative counter bucket went negative")
+			}
+		})
+	}
+}
+
+// TestDownsampleExponentialHistogramResetHints verifies that negative deltas
+// override counter hints but retain gauge semantics.
+func TestDownsampleExponentialHistogramResetHints(t *testing.T) {
+	const step = 60000
+	const start = int64(1688526000000)
+
+	mk := func(count float64, hint histogram.CounterResetHint, ts int64) sample {
+		return sample{
+			t: ts,
+			fh: &histogram.FloatHistogram{
+				Schema:           3,
+				ZeroThreshold:    2.938735877055719e-39,
+				Count:            count,
+				Sum:              count * 0.01,
+				CounterResetHint: hint,
+				PositiveSpans:    []histogram.Span{{Offset: -58, Length: 1}},
+				PositiveBuckets:  []float64{count},
+			},
+		}
+	}
+
+	lastCounter := func(t *testing.T, chks []chunks.Meta) *histogram.FloatHistogram {
+		testutil.Assert(t, len(chks) > 0, "no chunks")
+		ss := expandAggrChunk(t, chks[len(chks)-1], AggrCounter)
+		testutil.Assert(t, len(ss) > 0, "no counter samples")
+		return ss[len(ss)-1].fh
+	}
+
+	t.Run("count regression behind not counter reset hint resets", func(t *testing.T) {
+		var data []sample
+		for i := 0; i < 5; i++ {
+			hint := histogram.NotCounterReset
+			if i == 0 {
+				hint = histogram.UnknownCounterReset
+			}
+			data = append(data, mk(2, hint, start+int64(i)*step))
+		}
+		// The count drops from 2 to 1 behind a NotCounterReset hint, which must
+		// still be treated as a reset.
+		for i := 5; i < 10; i++ {
+			data = append(data, mk(1, histogram.NotCounterReset, start+int64(i)*step))
+		}
+		chks, err := DownsampleRaw(data, ResLevel1)
+		testutil.Ok(t, err)
+		// Reset semantics: the counter jumps to 2+1=3 instead of regressing.
+		testutil.Equals(t, float64(3), lastCounter(t, chks).Count)
+	})
+
+	t.Run("gauge regression keeps following deltas", func(t *testing.T) {
+		var data []sample
+		for i := 0; i < 5; i++ {
+			data = append(data, mk(2, histogram.GaugeType, start+int64(i)*step))
+		}
+		for i := 5; i < 10; i++ {
+			data = append(data, mk(1, histogram.GaugeType, start+int64(i)*step))
+		}
+		chks, err := DownsampleRaw(data, ResLevel1)
+		testutil.Ok(t, err)
+		// Gauges track the actual value: seed 2, delta -1.
+		testutil.Equals(t, float64(1), lastCounter(t, chks).Count)
+	})
+}
+
 func TestDownsampleAndReadResultingData(t *testing.T) {
 	data := []sample{
 		{t: 1688526018213, v: math.Float64frombits(value.NormalNaN)},
@@ -2910,4 +3050,14 @@ func TestDownsampleHistogramChunkCutFails(t *testing.T) {
 	_, err := DownsampleRaw(data, ResLevel1)
 	testutil.NotOk(t, err)
 	testutil.Assert(t, strings.Contains(err.Error(), "unexpected chunk cut"), "unexpected error: %v", err)
+}
+
+// expandAggrChunk returns the samples of the at sub-chunk of an aggregate chunk.
+func expandAggrChunk(t *testing.T, m chunks.Meta, at AggrType) []sample {
+	t.Helper()
+	ch, err := m.Chunk.(*AggrChunk).Get(at)
+	testutil.Ok(t, err)
+	var samples []sample
+	testutil.Ok(t, expandChunkIterator(ch.Iterator(nil), ch.Encoding(), &samples))
+	return samples
 }

@@ -385,7 +385,17 @@ func (h *histogramAggregator) add(s sample) {
 				panic(fmt.Sprintf("unexpected error: %v", err))
 			}
 
-			mustHistogramOp(h.counter.Add(deltaFh))
+			if fh.CounterResetHint != histogram.GaugeType && hasNegativeDelta(deltaFh) {
+				// A populated bucket shrank or disappeared: a counter reset
+				// that DetectReset did not report (it trusts NotCounterReset
+				// hints, and older Prometheus misses resets hidden behind
+				// empty buckets). The chunk appender detects the regression
+				// and would cut, so apply reset semantics like the branch
+				// above.
+				mustHistogramOp(h.counter.Add(fh))
+			} else {
+				mustHistogramOp(h.counter.Add(deltaFh))
+			}
 		}
 	} else {
 		// First sample sets the counter.
@@ -406,6 +416,26 @@ func (h *histogramAggregator) add(s sample) {
 
 	h.count++
 	h.total++
+}
+
+// hasNegativeDelta reports whether the difference between two cumulative
+// histograms shows any count regressing: the signature of a counter reset,
+// regardless of what hint the samples carried.
+func hasNegativeDelta(d *histogram.FloatHistogram) bool {
+	if d.Count < 0 || d.ZeroCount < 0 {
+		return true
+	}
+	for _, b := range d.PositiveBuckets {
+		if b < 0 {
+			return true
+		}
+	}
+	for _, b := range d.NegativeBuckets {
+		if b < 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *histogramAggregator) processedSamples() int {
