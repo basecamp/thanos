@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -226,7 +227,8 @@ func TestDownsampleNativeHistograms(t *testing.T) {
 		}
 
 		// Downsample raw.
-		chks := DownsampleRaw(data, ResLevel1)
+		chks, err := DownsampleRaw(data, ResLevel1)
+		testutil.Ok(t, err)
 		testutil.Assert(t, chks != nil, "Downsample from raw to 300s")
 
 		var aggrChunks []*AggrChunk
@@ -998,7 +1000,8 @@ func TestDownsampleAndReadResultingData(t *testing.T) {
 	)
 
 	// downsample from raw to 300s
-	chks := DownsampleRaw(data, ResLevel1)
+	chks, err := DownsampleRaw(data, ResLevel1)
+	testutil.Ok(t, err)
 	testutil.Assert(t, chks != nil, "Downsample from raw to 300s")
 
 	for _, c := range chks {
@@ -1008,7 +1011,8 @@ func TestDownsampleAndReadResultingData(t *testing.T) {
 				continue
 			} else {
 				testutil.Ok(t, expandChunkIterator(c.Chunk.Iterator(reuseIt), c.Chunk.Encoding(), &all), "expand chunk %d", c.Ref)
-				aggrDataChunks := DownsampleRaw(all, ResLevel1)
+				aggrDataChunks, err := DownsampleRaw(all, ResLevel1)
+				testutil.Ok(t, err)
 				for _, cn := range aggrDataChunks {
 					ac, ok = cn.Chunk.(*AggrChunk)
 					testutil.Assert(t, ok, "Not able to convert non-empty XOR chunks to 5m downsampled aggregated chunks.")
@@ -1023,7 +1027,7 @@ func TestDownsampleAndReadResultingData(t *testing.T) {
 
 	var downsampledChunks []chunks.Meta
 	// downsample from 300s to 3600s
-	err := downsampleAggr(
+	err = downsampleAggr(
 		aggrChunks,
 		&all,
 		chks[0].MinTime,
@@ -1174,7 +1178,7 @@ func TestDownsampleCounterBoundaryReset(t *testing.T) {
 		// Asking for more chunks than raw samples ensures that downsampleRawLoop
 		// will create chunks with samples from a single window.
 		var cm []chunks.Meta
-		downsampleRawLoop(test.raw, test.rawAggrResolution, len(test.raw)+1, &cm, downsampleFloatBatch)
+		testutil.Ok(t, downsampleRawLoop(test.raw, test.rawAggrResolution, len(test.raw)+1, &cm, downsampleFloatBatch))
 		testutil.Equals(t, test.expectedRawAggrChunks, len(cm))
 
 		rawAggrChunks := toAggrChunks(t, cm)
@@ -2872,4 +2876,38 @@ func TestDownsampleNHCutNewChunk(t *testing.T) {
 	require.False(t, cutNewChunk(chunkenc.EncFloatHistogram, chunkenc.EncFloatHistogram))
 	require.True(t, cutNewChunk(chunkenc.EncXOR, chunkenc.EncFloatHistogram))
 	require.True(t, cutNewChunk(chunkenc.EncXOR, chunkenc.EncHistogram))
+}
+
+// TestDownsampleHistogramChunkCutFails verifies that a histogram the chunk
+// appender can neither append nor recode fails downsampling instead of
+// replacing the aggregate chunk and silently dropping the windows already in
+// it. A changed zero threshold is such a histogram.
+func TestDownsampleHistogramChunkCutFails(t *testing.T) {
+	const step = int64(60_000)
+	const start = int64(1688526000000)
+
+	var data []sample
+	for i := 0; i < 10; i++ {
+		zeroThreshold := 0.001
+		if i >= 5 {
+			zeroThreshold = 0.01
+		}
+		c := float64(i + 1)
+		data = append(data, sample{
+			t: start + int64(i)*step,
+			fh: &histogram.FloatHistogram{
+				Schema:          3,
+				ZeroThreshold:   zeroThreshold,
+				ZeroCount:       c,
+				Count:           3 * c,
+				Sum:             c,
+				PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+				PositiveBuckets: []float64{c, c},
+			},
+		})
+	}
+
+	_, err := DownsampleRaw(data, ResLevel1)
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "unexpected chunk cut"), "unexpected error: %v", err)
 }
