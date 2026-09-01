@@ -227,8 +227,8 @@ func TestDownsampleNativeHistograms(t *testing.T) {
 		}
 
 		// Downsample raw.
-		chks, err := DownsampleRaw(data, ResLevel1)
-		testutil.Ok(t, err)
+		chks, dsErr := DownsampleRaw(data, ResLevel1)
+		testutil.Ok(t, dsErr)
 		testutil.Assert(t, chks != nil, "Downsample from raw to 300s")
 
 		var aggrChunks []*AggrChunk
@@ -1140,8 +1140,8 @@ func TestDownsampleAndReadResultingData(t *testing.T) {
 	)
 
 	// downsample from raw to 300s
-	chks, err := DownsampleRaw(data, ResLevel1)
-	testutil.Ok(t, err)
+	chks, dsErr := DownsampleRaw(data, ResLevel1)
+	testutil.Ok(t, dsErr)
 	testutil.Assert(t, chks != nil, "Downsample from raw to 300s")
 
 	for _, c := range chks {
@@ -1151,8 +1151,8 @@ func TestDownsampleAndReadResultingData(t *testing.T) {
 				continue
 			} else {
 				testutil.Ok(t, expandChunkIterator(c.Chunk.Iterator(reuseIt), c.Chunk.Encoding(), &all), "expand chunk %d", c.Ref)
-				aggrDataChunks, err := DownsampleRaw(all, ResLevel1)
-				testutil.Ok(t, err)
+				aggrDataChunks, dsErr := DownsampleRaw(all, ResLevel1)
+				testutil.Ok(t, dsErr)
 				for _, cn := range aggrDataChunks {
 					ac, ok = cn.Chunk.(*AggrChunk)
 					testutil.Assert(t, ok, "Not able to convert non-empty XOR chunks to 5m downsampled aggregated chunks.")
@@ -1167,7 +1167,7 @@ func TestDownsampleAndReadResultingData(t *testing.T) {
 
 	var downsampledChunks []chunks.Meta
 	// downsample from 300s to 3600s
-	err = downsampleAggr(
+	err := downsampleAggr(
 		aggrChunks,
 		&all,
 		chks[0].MinTime,
@@ -3018,38 +3018,47 @@ func TestDownsampleNHCutNewChunk(t *testing.T) {
 	require.True(t, cutNewChunk(chunkenc.EncXOR, chunkenc.EncHistogram))
 }
 
-// TestDownsampleHistogramChunkCutFails verifies that a histogram the chunk
-// appender can neither append nor recode fails downsampling instead of
-// replacing the aggregate chunk and silently dropping the windows already in
-// it. A changed zero threshold is such a histogram.
-func TestDownsampleHistogramChunkCutFails(t *testing.T) {
-	const step = int64(60_000)
-	const start = int64(1688526000000)
+// nhcbStart is aligned to a downsampling window so that the window membership
+// of every sample is deterministic.
+const (
+	nhcbStart = int64(1688526000000)
+	nhcbStep  = int64(60_000)
+)
 
-	var data []sample
-	for i := 0; i < 10; i++ {
-		zeroThreshold := 0.001
-		if i >= 5 {
-			zeroThreshold = 0.01
+func nhcbSample(ts int64, count float64, buckets []float64, bounds []float64, hint histogram.CounterResetHint) sample {
+	var sum float64
+	for _, b := range buckets {
+		sum += b
+	}
+	return sample{
+		t: ts,
+		fh: &histogram.FloatHistogram{
+			Schema:           histogram.CustomBucketsSchema,
+			CustomValues:     bounds,
+			Count:            count,
+			Sum:              sum,
+			CounterResetHint: hint,
+			PositiveSpans:    []histogram.Span{{Offset: 0, Length: uint32(len(buckets))}},
+			PositiveBuckets:  buckets,
+		},
+	}
+}
+
+// nhcbLayoutChangeSeries returns n samples one nhcbStep apart whose custom
+// bucket bounds switch from before to after at index changeAt. Every bucket
+// holds the sample index plus one, so the count grows monotonically across the
+// change.
+func nhcbLayoutChangeSeries(hint histogram.CounterResetHint, before, after []float64, changeAt, n int) []sample {
+	data := make([]sample, 0, n)
+	for i := 0; i < n; i++ {
+		bounds := before
+		if i >= changeAt {
+			bounds = after
 		}
 		c := float64(i + 1)
-		data = append(data, sample{
-			t: start + int64(i)*step,
-			fh: &histogram.FloatHistogram{
-				Schema:          3,
-				ZeroThreshold:   zeroThreshold,
-				ZeroCount:       c,
-				Count:           3 * c,
-				Sum:             c,
-				PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
-				PositiveBuckets: []float64{c, c},
-			},
-		})
+		data = append(data, nhcbSample(nhcbStart+int64(i)*nhcbStep, 4*c, []float64{c, c, c, c}, bounds, hint))
 	}
-
-	_, err := DownsampleRaw(data, ResLevel1)
-	testutil.NotOk(t, err)
-	testutil.Assert(t, strings.Contains(err.Error(), "unexpected chunk cut"), "unexpected error: %v", err)
+	return data
 }
 
 // expandAggrChunk returns the samples of the at sub-chunk of an aggregate chunk.
@@ -3060,4 +3069,413 @@ func expandAggrChunk(t *testing.T, m chunks.Meta, at AggrType) []sample {
 	var samples []sample
 	testutil.Ok(t, expandChunkIterator(ch.Iterator(nil), ch.Encoding(), &samples))
 	return samples
+}
+
+// nhcbTotalCount sums the count aggregate over all chunks, which is the number
+// of raw samples that were downsampled.
+func nhcbTotalCount(t *testing.T, chks []chunks.Meta) int {
+	t.Helper()
+	total := 0
+	for _, c := range chks {
+		for _, s := range expandAggrChunk(t, c, AggrCount) {
+			total += int(s.v)
+		}
+	}
+	return total
+}
+
+// nhcbChunkLayouts returns the custom bucket layout of the at sub-chunk of
+// every chunk and fails if the layout changes inside a sub-chunk.
+func nhcbChunkLayouts(t *testing.T, chks []chunks.Meta, at AggrType) [][]float64 {
+	t.Helper()
+	layouts := make([][]float64, 0, len(chks))
+	for _, c := range chks {
+		samples := expandAggrChunk(t, c, at)
+		testutil.Assert(t, len(samples) > 0, "empty %s sub-chunk", at)
+		testutil.Assert(t, samples[0].fh != nil, "nil histogram sample")
+		layout := samples[0].fh.CustomValues
+		for _, s := range samples[1:] {
+			testutil.Assert(t, s.fh != nil, "nil histogram sample")
+			testutil.Assert(t, histogram.FloatBucketsMatch(layout, s.fh.CustomValues), "layout changed within a sub-chunk")
+		}
+		layouts = append(layouts, layout)
+	}
+	return layouts
+}
+
+// assertOrderedUniqueTimestamps fails if the count aggregate timestamps are not
+// strictly increasing across chunks.
+func assertOrderedUniqueTimestamps(t *testing.T, chks []chunks.Meta) {
+	t.Helper()
+	last := int64(math.MinInt64)
+	for _, c := range chks {
+		for _, s := range expandAggrChunk(t, c, AggrCount) {
+			testutil.Assert(t, s.t > last, "timestamps must be strictly increasing across chunks, got %d after %d", s.t, last)
+			last = s.t
+		}
+	}
+}
+
+// TestDownsampleCustomBucketLayoutChange verifies that changing custom bucket
+// layouts are reduced per window and emitted in append-compatible chunks.
+func TestDownsampleCustomBucketLayoutChange(t *testing.T) {
+	boundsA := []float64{1, 2, 4}
+	boundsB := []float64{1, 3, 4}
+
+	// The bounds shrink to a prefix for a single sample in the middle of the
+	// second window.
+	full := []float64{1, 2, 3, 4}
+	prefix := []float64{1, 2}
+	var fullPrefixFull []sample
+	for i := 0; i < 15; i++ {
+		bounds, buckets := full, []float64{1, 1, 1, 1, 1}
+		if i == 7 {
+			bounds, buckets = prefix, []float64{1, 1, 1}
+		}
+		fullPrefixFull = append(fullPrefixFull, nhcbSample(nhcbStart+int64(i)*nhcbStep, float64(4*(i+1)), buckets, bounds, histogram.UnknownCounterReset))
+	}
+
+	// The bounds alternate on every sample, so every window holds both layouts.
+	var alternating []sample
+	for i := 0; i < 10; i++ {
+		bounds := boundsA
+		if i%2 == 1 {
+			bounds = boundsB
+		}
+		alternating = append(alternating, nhcbSample(nhcbStart+int64(i)*nhcbStep, float64(4*(i+1)), []float64{1, 1, 1, 1}, bounds, histogram.UnknownCounterReset))
+	}
+
+	// The layout changes in the same sample in which the count drops, which is
+	// a genuine counter reset.
+	resetWithChange := []sample{
+		nhcbSample(nhcbStart, 4, []float64{1, 1, 1, 1}, boundsA, histogram.UnknownCounterReset),
+		nhcbSample(nhcbStart+nhcbStep, 8, []float64{2, 2, 2, 2}, boundsA, histogram.UnknownCounterReset),
+		nhcbSample(nhcbStart+2*nhcbStep, 2, []float64{1, 1, 0, 0}, boundsB, histogram.UnknownCounterReset),
+		nhcbSample(nhcbStart+3*nhcbStep, 4, []float64{1, 1, 1, 1}, boundsB, histogram.UnknownCounterReset),
+	}
+
+	// A stale marker with an unrelated layout sits between the last sample of
+	// the old layout and the first sample of the new one.
+	withStale := nhcbLayoutChangeSeries(histogram.UnknownCounterReset, boundsA, boundsB, 23, 60)
+	stale := nhcbSample(nhcbStart+22*nhcbStep+nhcbStep/2, 0, []float64{0, 0, 0}, []float64{9, 99}, histogram.UnknownCounterReset)
+	stale.fh.Sum = math.Float64frombits(value.StaleNaN)
+	withStale = append(withStale, stale)
+	sort.Slice(withStale, func(i, j int) bool { return withStale[i].t < withStale[j].t })
+
+	for _, tcase := range []struct {
+		name string
+		data []sample
+
+		// expectedLayouts holds the counter layout of every emitted chunk, so
+		// its length is the expected number of chunks.
+		expectedLayouts [][]float64
+		// expectedTotal is the number of non-stale raw samples.
+		expectedTotal int
+		// expectedCounter is the last value of the cumulative counter.
+		expectedCounter float64
+	}{
+		{
+			name: "counter with bounds change mid window",
+			// The change lands inside the fifth window, which is reduced to the
+			// intersection of both layouts.
+			data:            nhcbLayoutChangeSeries(histogram.UnknownCounterReset, boundsA, boundsB, 23, 60),
+			expectedLayouts: [][]float64{boundsA, {1, 4}, boundsB},
+			expectedTotal:   60,
+			expectedCounter: 240,
+		},
+		{
+			name: "transition at window boundary",
+			// The change lands on a window head, so no window is mixed.
+			data:            nhcbLayoutChangeSeries(histogram.UnknownCounterReset, boundsA, boundsB, 25, 60),
+			expectedLayouts: [][]float64{boundsA, boundsB},
+			expectedTotal:   60,
+			expectedCounter: 240,
+		},
+		{
+			name:            "full prefix full inside one window",
+			data:            fullPrefixFull,
+			expectedLayouts: [][]float64{full, prefix, full},
+			expectedTotal:   15,
+			expectedCounter: 60,
+		},
+		{
+			name:            "same intersection in adjacent windows",
+			data:            alternating,
+			expectedLayouts: [][]float64{{1, 4}},
+			expectedTotal:   10,
+			expectedCounter: 40,
+		},
+		{
+			name:            "genuine reset coincident with layout change",
+			data:            resetWithChange,
+			expectedLayouts: [][]float64{{1, 4}},
+			expectedTotal:   4,
+			// The reset adds the absolute value of the new incarnation: 4, +4,
+			// reset to 2, +2.
+			expectedCounter: 12,
+		},
+		{
+			name:            "stale sample around the change is skipped",
+			data:            withStale,
+			expectedLayouts: [][]float64{boundsA, {1, 4}, boundsB},
+			expectedTotal:   60,
+			expectedCounter: 240,
+		},
+		{
+			name: "disjoint bounds produce overflow only middle segment",
+			// The mixed window has an empty intersection and keeps only the
+			// overflow bucket.
+			data:            nhcbLayoutChangeSeries(histogram.UnknownCounterReset, boundsA, []float64{10, 20, 30}, 23, 60),
+			expectedLayouts: [][]float64{boundsA, {}, {10, 20, 30}},
+			expectedTotal:   60,
+			expectedCounter: 240,
+		},
+		{
+			name:            "stable bounds in one segment",
+			data:            nhcbLayoutChangeSeries(histogram.UnknownCounterReset, boundsA, boundsB, 60, 60),
+			expectedLayouts: [][]float64{boundsA},
+			expectedTotal:   60,
+			expectedCounter: 240,
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			chks, err := DownsampleRaw(tcase.data, ResLevel1)
+			testutil.Ok(t, err)
+			testutil.Equals(t, len(tcase.expectedLayouts), len(chks))
+			testutil.Equals(t, tcase.expectedTotal, nhcbTotalCount(t, chks))
+			assertOrderedUniqueTimestamps(t, chks)
+
+			layouts := nhcbChunkLayouts(t, chks, AggrCounter)
+			for i, expected := range tcase.expectedLayouts {
+				testutil.Assert(t, histogram.FloatBucketsMatch(expected, layouts[i]), "chunk %d layout: expected %v, got %v", i, expected, layouts[i])
+			}
+
+			// The counter is re-seeded at the head of every chunk and chains
+			// deltas from there, so without a genuine reset it ends at the last
+			// raw count.
+			counter := expandAggrChunk(t, chks[len(chks)-1], AggrCounter)
+			testutil.Equals(t, tcase.expectedCounter, counter[len(counter)-1].fh.Count)
+		})
+	}
+}
+
+// TestDownsampleCustomBucketGaugeLayoutChange verifies that gauge histograms
+// with a changing custom bucket layout are segmented like counters.
+func TestDownsampleCustomBucketGaugeLayoutChange(t *testing.T) {
+	data := nhcbLayoutChangeSeries(histogram.GaugeType, []float64{1, 2, 4}, []float64{1, 3, 4}, 23, 60)
+	chks, err := DownsampleRaw(data, ResLevel1)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 3, len(chks))
+	testutil.Equals(t, len(data), nhcbTotalCount(t, chks))
+}
+
+// TestDownsampleMixedBucketKinds verifies that a series switching from
+// exponential to custom bucket histograms is rejected instead of being
+// aggregated.
+func TestDownsampleMixedBucketKinds(t *testing.T) {
+	var data []sample
+	for i := 0; i < 60; i++ {
+		c := float64(i + 1)
+		if i >= 23 {
+			data = append(data, nhcbSample(nhcbStart+int64(i)*nhcbStep, 4*c, []float64{c, c, c, c}, []float64{1, 2, 4}, histogram.UnknownCounterReset))
+			continue
+		}
+		data = append(data, sample{
+			t: nhcbStart + int64(i)*nhcbStep,
+			fh: &histogram.FloatHistogram{
+				Schema:          0,
+				Count:           2 * c,
+				Sum:             3 * c,
+				PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+				PositiveBuckets: []float64{c, c},
+			},
+		})
+	}
+	_, err := DownsampleRaw(data, ResLevel1)
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "mixed exponential and custom bucket histograms"), "unexpected error: %v", err)
+}
+
+// TestDownsampleCustomBucketLayoutChangeResLevel2 verifies that chunks
+// segmented by a custom bucket layout change downsample further from
+// ResLevel1 to ResLevel2 without losing samples or mixing layouts inside a
+// sub-chunk.
+func TestDownsampleCustomBucketLayoutChangeResLevel2(t *testing.T) {
+	data := nhcbLayoutChangeSeries(histogram.UnknownCounterReset, []float64{1, 2, 4}, []float64{1, 3, 4}, 23, 360)
+	chks, err := DownsampleRaw(data, ResLevel1)
+	testutil.Ok(t, err)
+
+	mb := newMemBlock()
+	var seriesChks []chunks.Meta
+	for _, c := range chks {
+		ac := AggrChunk(c.Chunk.Bytes())
+		seriesChks = append(seriesChks, chunks.Meta{MinTime: c.MinTime, MaxTime: c.MaxTime, Chunk: &ac})
+	}
+	mb.addSeries(&series{lset: labels.FromStrings(labels.MetricName, "nhcb_series"), chunks: seriesChks})
+
+	dir := t.TempDir()
+	id, err := Downsample(context.Background(), log.NewNopLogger(), &metadata.Meta{
+		Thanos: metadata.Thanos{
+			Downsample: metadata.ThanosDownsample{Resolution: ResLevel1},
+		},
+	}, mb, dir, ResLevel2)
+	testutil.Ok(t, err)
+
+	_, _, chkss := GetMetaLabelsAndChunks(t, dir, id)
+	chunkr, err := chunks.NewDirReader(filepath.Join(dir, id.String(), block.ChunksDirname), NewPool())
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, chunkr.Close()) }()
+
+	total := 0
+	for _, seriesChks := range chkss {
+		for _, cm := range seriesChks {
+			for _, s := range GetAggregateFromChunk(t, chunkr, cm, AggrCount) {
+				total += int(s.v)
+			}
+			counterSamples := GetAggregateFromChunk(t, chunkr, cm, AggrCounter)
+			for _, s := range counterSamples {
+				testutil.Assert(t, histogram.FloatBucketsMatch(counterSamples[0].fh.CustomValues, s.fh.CustomValues), "layout changed within a ResLevel2 sub-chunk")
+			}
+		}
+	}
+	testutil.Equals(t, len(data), total)
+}
+
+// TestDownsampleCustomBucketGoldenValues verifies the exact sum and counter
+// aggregates of a window whose custom bucket layout changes.
+func TestDownsampleCustomBucketGoldenValues(t *testing.T) {
+	data := []sample{
+		// Bounds {1,2,4}: buckets le1=1 (1,2]=2 (2,4]=3 inf=4 -> reduced [1, 5, 4].
+		nhcbSample(nhcbStart, 10, []float64{1, 2, 3, 4}, []float64{1, 2, 4}, histogram.UnknownCounterReset),
+		// Bounds {1,2,4}: buckets 2,2,3,5 -> reduced [2, 5, 5].
+		nhcbSample(nhcbStart+nhcbStep, 12, []float64{2, 2, 3, 5}, []float64{1, 2, 4}, histogram.UnknownCounterReset),
+		// Bounds {1,3,4}: buckets 3,1,4,6 -> reduced [3, 5, 6].
+		nhcbSample(nhcbStart+2*nhcbStep, 14, []float64{3, 1, 4, 6}, []float64{1, 3, 4}, histogram.UnknownCounterReset),
+	}
+	chks, err := DownsampleRaw(data, ResLevel1)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(chks))
+
+	getOne := func(at AggrType) *histogram.FloatHistogram {
+		samples := expandAggrChunk(t, chks[0], at)
+		testutil.Equals(t, 1, len(samples))
+		return samples[0].fh
+	}
+
+	sum := getOne(AggrSum)
+	testutil.Equals(t, []float64{1, 4}, sum.CustomValues)
+	testutil.Equals(t, []float64{6, 15, 15}, sum.PositiveBuckets)
+	testutil.Equals(t, float64(36), sum.Count)
+
+	// The counts are monotone in one layout after normalization, so the counter
+	// ends at the last absolute value with no false reset.
+	counter := getOne(AggrCounter)
+	testutil.Equals(t, []float64{1, 4}, counter.CustomValues)
+	testutil.Equals(t, []float64{3, 5, 6}, counter.PositiveBuckets)
+	testutil.Equals(t, float64(14), counter.Count)
+}
+
+// TestDownsampleCustomBucketHistogramsThroughBlock runs Downsample end to end on a block whose
+// custom-buckets series changes bucket layout mid-series and inspects the
+// written 5m and 1h blocks: one aggregate chunk per layout segment, a single
+// layout inside every sub-chunk, and no sample lost.
+func TestDownsampleCustomBucketHistogramsThroughBlock(t *testing.T) {
+	boundsA := []float64{1, 2, 4}
+	boundsB := []float64{1, 3, 4}
+	// Four hours at one sample per minute, with the layout changing inside
+	// the third hour: mid-window for both the 5m and the 1h level.
+	const (
+		step    = int64(60_000)
+		start   = int64(1688526000000)
+		samples = 240
+	)
+
+	var data []sample
+	for i := 0; i < samples; i++ {
+		bounds := boundsA
+		if i >= 137 {
+			bounds = boundsB
+		}
+		c := float64(i + 1)
+		data = append(data, nhcbSample(start+int64(i)*step, 4*c, []float64{c, c, c, c}, bounds, histogram.UnknownCounterReset))
+	}
+
+	dir := t.TempDir()
+	logger := log.NewNopLogger()
+	mb := blockFromChunks(chunksFromHistogramSamples(t, data))
+	rawMeta := &metadata.Meta{BlockMeta: tsdb.BlockMeta{MinTime: data[0].t, MaxTime: data[len(data)-1].t}}
+
+	// verifyBlock checks the written block and returns its meta.
+	verifyBlock := func(t *testing.T, id string, resolution int64) *metadata.Meta {
+		blk, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), filepath.Join(dir, id), NewPool(), tsdb.DefaultPostingsDecoderFactory)
+		testutil.Ok(t, err)
+		defer func() { testutil.Ok(t, blk.Close()) }()
+
+		meta, err := metadata.ReadFromDir(filepath.Join(dir, id))
+		testutil.Ok(t, err)
+		testutil.Equals(t, resolution, meta.Thanos.Downsample.Resolution)
+
+		indexr, err := blk.Index()
+		testutil.Ok(t, err)
+		defer func() { testutil.Ok(t, indexr.Close()) }()
+		chunkr, err := blk.Chunks()
+		testutil.Ok(t, err)
+		defer func() { testutil.Ok(t, chunkr.Close()) }()
+
+		k, v := index.AllPostingsKey()
+		p, err := indexr.Postings(context.Background(), k, v)
+		testutil.Ok(t, err)
+		var (
+			lbls    labels.ScratchBuilder
+			metas   []chunks.Meta
+			total   float64
+			nSeries int
+		)
+		for p.Next() {
+			nSeries++
+			testutil.Ok(t, indexr.Series(p.At(), &lbls, &metas))
+			testutil.Assert(t, len(metas) >= 2, "expected one aggregate chunk per layout segment, got %d", len(metas))
+			for _, m := range metas {
+				chk, _, err := chunkr.ChunkOrIterable(m)
+				testutil.Ok(t, err)
+				ac, ok := chk.(*AggrChunk)
+				testutil.Assert(t, ok, "expected an AggrChunk")
+
+				countChunk, err := ac.Get(AggrCount)
+				testutil.Ok(t, err)
+				var counts []sample
+				testutil.Ok(t, expandChunkIterator(countChunk.Iterator(nil), countChunk.Encoding(), &counts))
+				for _, s := range counts {
+					total += s.v
+				}
+
+				for _, at := range []AggrType{AggrSum, AggrCounter} {
+					sub, err := ac.Get(at)
+					testutil.Ok(t, err)
+					var hs []sample
+					testutil.Ok(t, expandChunkIterator(sub.Iterator(nil), sub.Encoding(), &hs))
+					testutil.Assert(t, len(hs) > 0, "empty %s sub-chunk", at)
+					for _, s := range hs {
+						testutil.Assert(t, s.fh != nil && histogram.FloatBucketsMatch(hs[0].fh.CustomValues, s.fh.CustomValues),
+							"layout changed inside a %s sub-chunk", at)
+					}
+				}
+			}
+		}
+		testutil.Ok(t, p.Err())
+		testutil.Equals(t, 1, nSeries)
+		testutil.Equals(t, float64(samples), total)
+		return meta
+	}
+
+	id5m, err := Downsample(context.Background(), logger, rawMeta, mb, dir, ResLevel1)
+	testutil.Ok(t, err)
+	meta5m := verifyBlock(t, id5m.String(), ResLevel1)
+
+	blk5m, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), filepath.Join(dir, id5m.String()), NewPool(), tsdb.DefaultPostingsDecoderFactory)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, blk5m.Close()) }()
+	id1h, err := Downsample(context.Background(), logger, meta5m, blk5m, dir, ResLevel2)
+	testutil.Ok(t, err)
+	verifyBlock(t, id1h.String(), ResLevel2)
 }

@@ -154,6 +154,8 @@ This means that for each series we collect various aggregations with a given int
 
 Native histogram downsampling leverages the fact that one can aggregate & reduce schema i.e. downsample native histograms. Native histograms only store 3 aggregations - counter, count, and sum. Sum and count are used to produce "an average" native histogram. Counter is a counter that is used with functions irate, rate, increase, and resets.
 
+Native histograms with custom buckets whose bucket layout changes over time are reduced, per downsampling window, to the layout the histograms in that window have in common, and a new aggregate chunk is started whenever consecutive windows end up with different layouts.
+
 ### ⚠ ️Downsampling: Note About Resolution and Retention ⚠️
 
 Resolution is a distance between data points on your graphs. E.g.
