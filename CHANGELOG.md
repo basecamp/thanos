@@ -8,6 +8,16 @@ NOTE: As semantic versioning states all 0.y.z releases can contain breaking chan
 
 We use *breaking :warning:* to mark changes that are not backward compatible (relates only to v0.y.z releases.)
 
+## Unreleased
+
+### Fixed
+
+- [#1](https://github.com/basecamp/thanos/pull/1) Compact: support downsampling native histograms with changing custom bucket layouts. Fixes panic `unexpected error: cannot apply this operation on custom buckets histograms with different custom bounds`.
+
+### Added
+
+### Changed
+
 ## [v0.40.1](https://github.com/thanos-io/thanos/tree/release-0.40) - 2025 10 28
 
 ### Fixed

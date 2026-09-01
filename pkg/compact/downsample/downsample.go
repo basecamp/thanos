@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -349,52 +350,69 @@ func (h *histogramAggregator) reset() {
 	h.sum = nil
 }
 
-func mustHistogramOp(_ *histogram.FloatHistogram, err error) {
-	// NOTE(GiedriusS): this can only happen with custom
-	// boundaries. We do not support them yet.
-	if err != nil {
-		panic(fmt.Sprintf("unexpected error: %v", err))
-	}
-}
-
 func (h *histogramAggregator) add(s sample) {
 	fh := s.fh
-	if fh.Schema < h.schema {
-		panic("schema must be greater or equal to aggregator schema")
+	// Custom-buckets histograms all share a sentinel schema; only exponential
+	// histograms participate in resolution reduction.
+	if !fh.UsesCustomBuckets() {
+		if fh.Schema < h.schema {
+			panic("schema must be greater or equal to aggregator schema")
+		}
+
+		// If schema of the sample is greater than the
+		// aggregator schema, we need to reduce the resolution.
+		if fh.Schema > h.schema {
+			fh = fh.CopyToSchema(h.schema)
+		}
 	}
 
-	// A schema increase is treated as a reset, so we need to preserve
-	// the original histogram in case the schema is adjusted.
-	oFh := fh
-	// If schema of the sample is greater than the
-	// aggregator schema, we need to reduce the resolution.
-	if fh.Schema > h.schema {
-		fh = fh.CopyToSchema(h.schema)
+	// A schema increase is treated as a reset, so we preserve the original
+	// histogram for reset detection. Custom-buckets histograms are compared
+	// after layout normalization instead: layout differences within the batch
+	// were deliberately erased above and must not read as resets.
+	oFh := s.fh
+	if s.fh.UsesCustomBuckets() {
+		oFh = fh
 	}
 
 	if h.total > 0 {
 		if fh.CounterResetHint != histogram.GaugeType && oFh.DetectReset(h.previous) {
 			// Counter reset, correct the value.
-			mustHistogramOp(h.counter.Add(fh))
+			if _, err := h.counter.Add(fh); err != nil {
+				// The bucket layout changed (custom-buckets bounds, or a switch
+				// between custom and exponential buckets). Prometheus treats a
+				// layout change as a counter reset (FloatHistogram.DetectReset),
+				// and the chunk appenders cut a CounterReset chunk on it, so
+				// restart the counter in the new layout for the same effect.
+				h.counter = fh.Copy()
+			}
 		} else {
 			// Add delta with previous value to the counter.
 			deltaFh, err := fh.Copy().Sub(h.previous)
-			if err != nil {
-				// TODO(GiedriusS): support native histograms with custom buckets.
-				// This can only happen with custom buckets.
-				panic(fmt.Sprintf("unexpected error: %v", err))
-			}
-
-			if fh.CounterResetHint != histogram.GaugeType && hasNegativeDelta(deltaFh) {
+			switch {
+			case err != nil:
+				// Layout change on a gauge histogram (counter-like histograms
+				// take the DetectReset branch above): restart from the new
+				// layout, mirroring the counter-reset treatment.
+				h.counter = fh.Copy()
+			case fh.CounterResetHint != histogram.GaugeType && hasNegativeDelta(deltaFh):
 				// A populated bucket shrank or disappeared: a counter reset
 				// that DetectReset did not report (it trusts NotCounterReset
 				// hints, and older Prometheus misses resets hidden behind
 				// empty buckets). The chunk appender detects the regression
 				// and would cut, so apply reset semantics like the branch
 				// above.
-				mustHistogramOp(h.counter.Add(fh))
-			} else {
-				mustHistogramOp(h.counter.Add(deltaFh))
+				if _, err := h.counter.Add(fh); err != nil {
+					h.counter = fh.Copy()
+				}
+			default:
+				if _, err := h.counter.Add(deltaFh); err != nil {
+					// Unreachable in practice: a successful Sub proves fh and
+					// previous share a layout, and the counter always carries the
+					// layout of the samples that built it. Restart rather than
+					// crash the compactor if that invariant ever breaks.
+					h.counter = fh.Copy()
+				}
 			}
 		}
 	} else {
@@ -404,8 +422,11 @@ func (h *histogramAggregator) add(s sample) {
 
 	if h.sum == nil {
 		h.sum = fh.Copy()
-	} else {
-		mustHistogramOp(h.sum.Add(fh))
+	} else if _, err := h.sum.Add(fh); err != nil {
+		// The downsampling window straddles a bucket-layout change: restart
+		// the window sum from the new layout. Query-time reset handling makes
+		// the same trade on raw data.
+		h.sum = fh.Copy()
 	}
 
 	// This needs to be h gauge histogram, otherwise reset detection will be triggered
@@ -465,14 +486,201 @@ func newHistogramAggrChunkBuilder(isGaugeSamples bool) *aggrChunkBuilder {
 	return b
 }
 
-func minSchema(samples []sample) int32 {
+func minSchema(streams ...[]sample) int32 {
 	schema := int32(math.MaxInt32)
-	for _, s := range samples {
-		if s.fh != nil && !value.IsStaleNaN(s.fh.Sum) && s.fh.Schema < schema {
-			schema = s.fh.Schema
+	for _, samples := range streams {
+		for _, s := range samples {
+			// Custom-buckets histograms use a sentinel schema that does not
+			// participate in exponential resolution reduction.
+			if s.fh != nil && !value.IsStaleNaN(s.fh.Sum) && !s.fh.UsesCustomBuckets() && s.fh.Schema < schema {
+				schema = s.fh.Schema
+			}
 		}
 	}
 	return schema
+}
+
+// commonCustomLayout returns the intersection of the custom bucket bounds of
+// all custom-buckets histograms in the batch, and whether every custom
+// histogram already uses that exact layout. The intersection is the finest
+// layout that every histogram in the batch can be reduced to exactly.
+func commonCustomLayout(streams ...[]sample) ([]float64, bool) {
+	var common []float64
+	first := true
+	uniform := true
+	for _, samples := range streams {
+		for _, s := range samples {
+			if s.fh == nil || !s.fh.UsesCustomBuckets() || value.IsStaleNaN(s.fh.Sum) {
+				continue
+			}
+			if first {
+				common = append(common, s.fh.CustomValues...)
+				first = false
+				continue
+			}
+			if histogram.FloatBucketsMatch(common, s.fh.CustomValues) {
+				continue
+			}
+			uniform = false
+			// Intersect: keep the bounds of common that also appear in this sample.
+			merged := common[:0]
+			i, j := 0, 0
+			for i < len(common) && j < len(s.fh.CustomValues) {
+				switch {
+				case common[i] == s.fh.CustomValues[j]:
+					merged = append(merged, common[i])
+					i++
+					j++
+				case common[i] < s.fh.CustomValues[j]:
+					i++
+				default:
+					j++
+				}
+			}
+			common = merged
+		}
+	}
+	return common, uniform
+}
+
+// reduceSamplesToLayout returns a copy of the samples with every custom
+// buckets histogram reduced to the given layout.
+func reduceSamplesToLayout(in []sample, layout []float64) []sample {
+	out := make([]sample, len(in))
+	copy(out, in)
+	for i, s := range out {
+		if s.fh != nil && s.fh.UsesCustomBuckets() && !value.IsStaleNaN(s.fh.Sum) {
+			out[i].fh = reduceToCustomLayout(s.fh, layout)
+		}
+	}
+	return out
+}
+
+// reduceToCustomLayout returns a copy of fh with its buckets merged down to
+// the target bounds, which must be a subset of fh's bounds. Merging adjacent
+// buckets at shared boundaries is exact: no observation changes buckets
+// relative to the target layout.
+func reduceToCustomLayout(fh *histogram.FloatHistogram, bounds []float64) *histogram.FloatHistogram {
+	if histogram.FloatBucketsMatch(fh.CustomValues, bounds) {
+		return fh
+	}
+	// Expand the (possibly sparse) source buckets into dense counts.
+	src := make([]float64, len(fh.CustomValues)+1)
+	idx := 0
+	bucket := 0
+	for _, span := range fh.PositiveSpans {
+		idx += int(span.Offset)
+		for k := 0; k < int(span.Length); k++ {
+			if idx < len(src) {
+				src[idx] = fh.PositiveBuckets[bucket]
+			}
+			idx++
+			bucket++
+		}
+	}
+	// Merge into the target layout: target bucket k covers everything up to
+	// bounds[k]; the final bucket is the implicit +Inf overflow.
+	dst := make([]float64, len(bounds)+1)
+	j := 0
+	for i, c := range src {
+		upper := math.Inf(1)
+		if i < len(fh.CustomValues) {
+			upper = fh.CustomValues[i]
+		}
+		for j < len(bounds) && bounds[j] < upper {
+			j++
+		}
+		dst[min(j, len(dst)-1)] += c
+	}
+	out := &histogram.FloatHistogram{
+		Schema:           histogram.CustomBucketsSchema,
+		CustomValues:     bounds,
+		Count:            fh.Count,
+		Sum:              fh.Sum,
+		CounterResetHint: fh.CounterResetHint,
+		PositiveSpans:    []histogram.Span{{Offset: 0, Length: uint32(len(dst))}},
+		PositiveBuckets:  dst,
+	}
+	return out
+}
+
+// histWindow is one planned output window: its emitted timestamp, its
+// samples (custom histograms already reduced to the window layout), and the
+// emitted custom layout (nil layout with custom=false for exponential-only).
+type histWindow struct {
+	endT    int64
+	samples []sample
+	custom  bool
+	layout  []float64
+}
+
+// planHistogramWindows partitions a batch into output windows, rejects
+// windows that mix bucket kinds, and reduces each window's custom histograms
+// to that window's common layout (the intersection of its custom bounds).
+func planHistogramWindows(batch []sample, resolution int64) ([]histWindow, error) {
+	var wins []histWindow
+	// Windows are clamped to the batch's last timestamp, like downsampleBatch:
+	// a subsequent batch may otherwise overlap in time range.
+	lastT := batch[len(batch)-1].t
+	for i := 0; i < len(batch); {
+		w := min(currentWindow(batch[i].t, resolution), lastT)
+		j := i
+		memberW := currentWindow(batch[i].t, resolution)
+		for ; j < len(batch) && batch[j].t <= memberW; j++ {
+		}
+		winSamples := batch[i:j]
+		i = j
+
+		hasCustom, hasExp := false, false
+		for _, s := range winSamples {
+			if s.fh == nil || value.IsStaleNaN(s.fh.Sum) {
+				continue
+			}
+			if s.fh.UsesCustomBuckets() {
+				hasCustom = true
+			} else {
+				hasExp = true
+			}
+		}
+		if hasCustom && hasExp {
+			return nil, errors.Errorf("mixed exponential and custom bucket histograms in window ending at %d with resolution %d", w, resolution)
+		}
+
+		win := histWindow{endT: w, samples: winSamples, custom: hasCustom}
+		if hasCustom {
+			layout, uniform := commonCustomLayout(winSamples)
+			win.layout = layout
+			if !uniform {
+				win.samples = reduceSamplesToLayout(winSamples, layout)
+			}
+		}
+		wins = append(wins, win)
+	}
+	return wins, nil
+}
+
+// segmentHistogramWindows groups consecutive windows into maximal runs whose
+// emitted layouts are append-compatible: custom windows sharing one layout,
+// or exponential windows (whose schemas are unified per batch by minSchema).
+// A kind change between windows is rejected by planHistogramWindows already,
+// so runs only break on custom layout changes.
+func segmentHistogramWindows(wins []histWindow) [][]histWindow {
+	var segs [][]histWindow
+	var cur []histWindow
+	for _, w := range wins {
+		if len(cur) > 0 {
+			prev := cur[len(cur)-1]
+			if w.custom != prev.custom || (w.custom && !histogram.FloatBucketsMatch(w.layout, prev.layout)) {
+				segs = append(segs, cur)
+				cur = nil
+			}
+		}
+		cur = append(cur, w)
+	}
+	if len(cur) > 0 {
+		segs = append(segs, cur)
+	}
+	return segs
 }
 
 func downsampleFloatBatch(batch []sample, resolution int64) ([]chunks.Meta, error) {
@@ -486,27 +694,68 @@ func downsampleFloatBatch(batch []sample, resolution int64) ([]chunks.Meta, erro
 }
 
 func downsampleHistogramBatch(batch []sample, resolution int64) ([]chunks.Meta, error) {
-	// We need to know the smallest schema in advanced otherwise we might end
-	// up with a non appendable histogram if histogram.schema < chunk.schema.
-	schema := minSchema(batch)
-	ab := newHistogramAggrChunkBuilder(isGaugeSamples(batch))
-	var addErr error
-	downsampleBatch(batch, resolution, newHistogramAggregator(schema), func(t int64, a sampleAggregator) {
-		if addErr != nil {
-			return
-		}
-		addErr = ab.addHistogram(t, a)
-	})
-	if addErr != nil {
-		return nil, addErr
+	// Window-first: partition into output windows, reduce each window's
+	// custom histograms to that window's common layout, then group windows
+	// into maximal segments of append-compatible emitted layouts. Each
+	// segment becomes its own AggrChunk, so no chunk ever needs to change
+	// layout mid-stream (which the one-chunk-per-aggregate format cannot
+	// represent without losing samples).
+	wins, err := planHistogramWindows(batch, resolution)
+	if err != nil {
+		return nil, err
 	}
-	return []chunks.Meta{ab.encode()}, nil
+	// We need to know the smallest schema in advance otherwise we might end
+	// up with a non appendable histogram if histogram.schema < chunk.schema.
+	// Custom histograms use a sentinel schema and are excluded.
+	schema := minSchema(batch)
+	isGauge := isGaugeSamples(batch)
+
+	var out []chunks.Meta
+	for _, seg := range segmentHistogramWindows(wins) {
+		ab := newHistogramAggrChunkBuilder(isGauge)
+		// The counter chain restarts at each segment head: across an
+		// incompatible layout boundary, query-time reset handling sees the
+		// new segment exactly as it sees the raw series after its layout
+		// change, and the boundary sits at the true change window.
+		agg := newHistogramAggregator(schema)
+		for _, w := range seg {
+			nonEmpty := false
+			for _, sm := range w.samples {
+				if sm.fh == nil || value.IsStaleNaN(sm.fh.Sum) {
+					continue
+				}
+				agg.add(sm)
+				nonEmpty = true
+			}
+			if !nonEmpty {
+				continue
+			}
+			if err := ab.addHistogram(w.endT, agg); err != nil {
+				return nil, err
+			}
+			agg.reset()
+		}
+		if ab.added > 0 {
+			out = append(out, ab.encode())
+		}
+	}
+	return out, nil
 }
 
 type sampleAggregator interface {
 	reset()
 	add(s sample)
 	processedSamples() int
+}
+
+// extendTimeRange widens the builder's time range to include t.
+func (b *aggrChunkBuilder) extendTimeRange(t int64) {
+	if t < b.mint {
+		b.mint = t
+	}
+	if t > b.maxt {
+		b.maxt = t
+	}
 }
 
 func (b *aggrChunkBuilder) addHistogram(t int64, a sampleAggregator) error {
@@ -547,11 +796,13 @@ func (b *aggrChunkBuilder) appendFloatHistogram(t AggrType, ts int64, fh *histog
 	}
 	if ch != nil {
 		if !recoded {
-			// A cut would replace the aggregate's single chunk and lose
-			// every sample already in it; fail the batch instead of
+			// A genuine cut would replace the aggregate's single chunk and
+			// lose every sample already in it. Segmentation guarantees
+			// appended histograms are append-compatible, so a cut here means
+			// the segment invariant is broken - fail the batch instead of
 			// silently dropping history.
 			return errors.Errorf(
-				"unexpected chunk cut at timestamp %d (aggregate=%s hint=%d schema=%d zeroThreshold=%g count=%g positive=%d negative=%d)",
+				"unexpected chunk cut at timestamp %d (aggregate=%s hint=%d schema=%d zeroThreshold=%g count=%g positive=%d negative=%d): segment layout invariant violated",
 				ts, t, fh.CounterResetHint, fh.Schema, fh.ZeroThreshold, fh.Count, len(fh.PositiveBuckets), len(fh.NegativeBuckets))
 		}
 		// A recode returns the whole chunk re-encoded with a wider bucket
@@ -690,7 +941,7 @@ func (b *aggrChunkBuilder) encode() chunks.Meta {
 	}
 }
 
-// DownsampleRaw create a series of aggregation chunks for the given sample data.
+// DownsampleRaw creates aggregation chunks for the given samples.
 func DownsampleRaw(data []sample, resolution int64) ([]chunks.Meta, error) {
 	if len(data) == 0 {
 		return nil, nil
@@ -761,98 +1012,223 @@ func downsampleRawLoop(
 	return nil
 }
 
-func downsampleHistogramAggrBatch(chks []*AggrChunk, buf *[]sample, resolution int64) ([]chunks.Meta, error) {
-	mint, maxt := int64(math.MaxInt64), int64(math.MinInt64)
+// histogramAggrWindow is one planned output window of the histogram
+// aggregate path: the counter, sum and count samples that fall into it and
+// the custom bucket layout its histograms are emitted with.
+type histogramAggrWindow struct {
+	endT         int64
+	counter      []sample
+	sum          []sample
+	count        []sample
+	custom       bool
+	hasHistogram bool
+	layout       []float64
+}
+
+// expandHistogramAggrStreams expands the counter, sum and count streams of
+// the given aggregate chunks. Native histograms only carry those three
+// aggregates, and their output windows are planned jointly so that every
+// emitted AggrChunk holds aligned sub-chunks.
+func expandHistogramAggrStreams(chks []*AggrChunk) (counter, sum, count []sample, err error) {
 	var reuseIt chunkenc.Iterator
+	expand := func(at AggrType, dst *[]sample, expander func(chunkenc.Iterator, *[]sample) error) error {
+		for _, achk := range chks {
+			c, err := achk.Get(at)
+			if err == ErrAggrNotExist {
+				continue
+			} else if err != nil {
+				return err
+			}
+			if err := expander(c.Iterator(reuseIt), dst); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := expand(AggrCounter, &counter, expandFloatHistogramChunkIterator); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := expand(AggrSum, &sum, expandFloatHistogramChunkIterator); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := expand(AggrCount, &count, expandXorChunkIterator); err != nil {
+		return nil, nil, nil, err
+	}
+	return counter, sum, count, nil
+}
 
-	// Native histograms support counter, sum, count types.
+// planHistogramAggrWindows partitions the three streams into output windows,
+// rejects windows mixing exponential and custom buckets, and reduces the
+// histograms of each custom buckets window to the layout its counter and sum
+// samples have in common. Window ends are clamped to the batch's last
+// timestamp, like downsampleBatch, so subsequent batches cannot overlap.
+func planHistogramAggrWindows(counter, sum, count []sample, resolution int64) ([]*histogramAggrWindow, error) {
+	lastT := int64(math.MinInt64)
+	for _, stream := range [][]sample{counter, sum, count} {
+		for _, s := range stream {
+			lastT = max(lastT, s.t)
+		}
+	}
 
-	// Expand all samples for the counter aggregate type.
-	*buf = (*buf)[:0]
-	for _, achk := range chks {
-		c, err := achk.Get(AggrCounter)
-		if err == ErrAggrNotExist {
+	windows := map[int64]*histogramAggrWindow{}
+	var order []int64
+	get := func(t int64) *histogramAggrWindow {
+		w := min(currentWindow(t, resolution), lastT)
+		hw := windows[w]
+		if hw == nil {
+			hw = &histogramAggrWindow{endT: w}
+			windows[w] = hw
+			order = append(order, w)
+		}
+		return hw
+	}
+	for _, s := range counter {
+		hw := get(s.t)
+		hw.counter = append(hw.counter, s)
+	}
+	for _, s := range sum {
+		hw := get(s.t)
+		hw.sum = append(hw.sum, s)
+	}
+	for _, s := range count {
+		hw := get(s.t)
+		hw.count = append(hw.count, s)
+	}
+	slices.Sort(order)
+
+	planned := make([]*histogramAggrWindow, 0, len(order))
+	for _, w := range order {
+		hw := windows[w]
+		hasCustom, hasExp := false, false
+		for _, stream := range [][]sample{hw.counter, hw.sum} {
+			for _, s := range stream {
+				if s.fh == nil || value.IsStaleNaN(s.fh.Sum) {
+					continue
+				}
+				hw.hasHistogram = true
+				if s.fh.UsesCustomBuckets() {
+					hasCustom = true
+				} else {
+					hasExp = true
+				}
+			}
+		}
+		if hasCustom && hasExp {
+			return nil, errors.Errorf("mixed exponential and custom bucket histograms in window ending at %d with resolution %d", w, resolution)
+		}
+		hw.custom = hasCustom
+		if hasCustom {
+			layout, uniform := commonCustomLayout(hw.counter, hw.sum)
+			hw.layout = layout
+			if !uniform {
+				hw.counter = reduceSamplesToLayout(hw.counter, layout)
+				hw.sum = reduceSamplesToLayout(hw.sum, layout)
+			}
+		}
+		planned = append(planned, hw)
+	}
+	return planned, nil
+}
+
+// segmentHistogramAggrWindows groups consecutive windows into maximal runs
+// whose emitted layouts are append-compatible, like segmentHistogramWindows.
+// Windows without histograms never start a new segment.
+func segmentHistogramAggrWindows(windows []*histogramAggrWindow) [][]*histogramAggrWindow {
+	var segs [][]*histogramAggrWindow
+	var cur []*histogramAggrWindow
+	for _, hw := range windows {
+		if len(cur) > 0 {
+			prev := cur[len(cur)-1]
+			if hw.hasHistogram && prev.hasHistogram &&
+				(hw.custom != prev.custom || (hw.custom && !histogram.FloatBucketsMatch(hw.layout, prev.layout))) {
+				segs = append(segs, cur)
+				cur = nil
+			}
+		}
+		cur = append(cur, hw)
+	}
+	if len(cur) > 0 {
+		segs = append(segs, cur)
+	}
+	return segs
+}
+
+// appendAggregatedHistogram aggregates the histogram samples of one window
+// and appends the aggregate chosen by pick to the builder.
+func appendAggregatedHistogram(ab *aggrChunkBuilder, at AggrType, t int64, agg *histogramAggregator, samples []sample, pick func(*histogramAggregator) *histogram.FloatHistogram) error {
+	added := false
+	for _, s := range samples {
+		if s.fh == nil || value.IsStaleNaN(s.fh.Sum) {
 			continue
-		} else if err != nil {
-			return nil, err
 		}
-		if err := expandFloatHistogramChunkIterator(c.Iterator(reuseIt), buf); err != nil {
-			return nil, err
+		agg.add(s)
+		added = true
+	}
+	if !added {
+		return nil
+	}
+	fh := pick(agg)
+	if ab.isGaugeSamples {
+		fh.CounterResetHint = histogram.GaugeType
+	}
+	if err := ab.appendFloatHistogram(at, t, fh); err != nil {
+		return err
+	}
+	ab.extendTimeRange(t)
+	agg.reset()
+	return nil
+}
+
+// encodeHistogramAggrSegments encodes every segment as its own AggrChunk.
+// The counter chain restarts at each segment head, exactly as it does after
+// a layout change in the raw series.
+func encodeHistogramAggrSegments(segs [][]*histogramAggrWindow, schema int32, isGauge bool) ([]chunks.Meta, error) {
+	var out []chunks.Meta
+	for _, seg := range segs {
+		ab := newHistogramAggrChunkBuilder(isGauge)
+		counterAgg := newHistogramAggregator(schema)
+		sumAgg := newHistogramAggregator(schema)
+		for _, hw := range seg {
+			if err := appendAggregatedHistogram(ab, AggrCounter, hw.endT, counterAgg, hw.counter, func(a *histogramAggregator) *histogram.FloatHistogram { return a.counter }); err != nil {
+				return nil, err
+			}
+			if err := appendAggregatedHistogram(ab, AggrSum, hw.endT, sumAgg, hw.sum, func(a *histogramAggregator) *histogram.FloatHistogram { return a.sum }); err != nil {
+				return nil, err
+			}
+			if len(hw.count) > 0 {
+				var cnt float64
+				for _, s := range hw.count {
+					cnt += s.v
+				}
+				ab.apps[AggrCount].Append(hw.endT, cnt)
+				ab.extendTimeRange(hw.endT)
+				ab.added++
+			}
+		}
+		if ab.added > 0 && ab.mint != math.MaxInt64 {
+			out = append(out, ab.encode())
 		}
 	}
+	return out, nil
+}
 
-	ab := newHistogramAggrChunkBuilder(isGaugeSamples(*buf))
-
-	var appendErr error
-	schema := minSchema(*buf)
-	downsampleBatch(*buf, resolution, newHistogramAggregator(schema), func(t int64, a sampleAggregator) {
-		if appendErr != nil {
-			return
-		}
-		if t < mint {
-			mint = t
-		}
-		if t > maxt {
-			maxt = t
-		}
-		appendErr = ab.appendFloatHistogram(AggrCounter, t, mustGetHistogramAggregator(a).counter)
-	})
-	if appendErr != nil {
-		return nil, appendErr
-	}
-
-	// Expand all samples for the sum aggregate.
-	*buf = (*buf)[:0]
-	for _, achk := range chks {
-		c, err := achk.Get(AggrSum)
-		if err == ErrAggrNotExist {
-			continue
-		} else if err != nil {
-			return nil, err
-		}
-		if err := expandFloatHistogramChunkIterator(c.Iterator(reuseIt), buf); err != nil {
-			return nil, err
-		}
-	}
-	if len(*buf) == 0 {
-		return nil, nil
-	}
-
-	schema = minSchema(*buf)
-	downsampleBatch(*buf, resolution, newHistogramAggregator(schema), func(t int64, a sampleAggregator) {
-		if appendErr != nil {
-			return
-		}
-		if t < mint {
-			mint = t
-		}
-		if t > maxt {
-			maxt = t
-		}
-		appendErr = ab.appendFloatHistogram(AggrSum, t, mustGetHistogramAggregator(a).sum)
-	})
-	if appendErr != nil {
-		return nil, appendErr
-	}
-
-	*buf = (*buf)[:0]
-	batchMint, batchMaxt, err := genericAggregate(AggrCount, chks, buf, ab, resolution, func(a sampleAggregator) float64 {
-		aggr := mustGetFloatAggregator(a)
-		return aggr.sum
-	})
+func downsampleHistogramAggrBatch(chks []*AggrChunk, _ *[]sample, resolution int64) ([]chunks.Meta, error) {
+	counter, sum, count, err := expandHistogramAggrStreams(chks)
 	if err != nil {
 		return nil, err
 	}
-	if batchMint < mint {
-		mint = batchMint
+	if len(counter) == 0 && len(sum) == 0 {
+		return nil, nil
 	}
-	if batchMaxt > maxt {
-		maxt = batchMaxt
+	windows, err := planHistogramAggrWindows(counter, sum, count, resolution)
+	if err != nil {
+		return nil, err
 	}
-
-	ab.mint = mint
-	ab.maxt = maxt
-	return []chunks.Meta{ab.encode()}, nil
+	isGauge := isGaugeSamples(counter)
+	if len(counter) == 0 {
+		isGauge = isGaugeSamples(sum)
+	}
+	return encodeHistogramAggrSegments(segmentHistogramAggrWindows(windows), minSchema(counter, sum), isGauge)
 }
 
 // genericAggregate does a generic aggregation for count, sum, min, and max aggregates.
