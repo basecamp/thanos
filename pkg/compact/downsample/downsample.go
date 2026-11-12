@@ -1498,7 +1498,9 @@ func downsampleAggrLoop(
 	// counter values are the true values of the original series. We need
 	// to preserve them even across multiple aggregation iterations.
 	res := make([]chunks.Meta, 0, numChunks)
-	batchSize := len(chks) / numChunks
+	// At least one chunk per batch: with fewer chunks than target chunks the
+	// loop below would never consume anything.
+	batchSize := max(1, len(chks)/numChunks)
 
 	for len(chks) > 0 {
 		j := min(batchSize, len(chks))
