@@ -156,6 +156,8 @@ Native histogram downsampling leverages the fact that one can aggregate & reduce
 
 Native histograms with custom buckets whose bucket layout changes over time are reduced, per downsampling window, to the layout the histograms in that window have in common, and a new aggregate chunk is started whenever consecutive windows end up with different layouts.
 
+A series that switches between exponential and custom buckets histograms is downsampled as if it were one series per stretch of a kind. A new aggregate chunk is started where the kind changes, a downsampling window that holds the change yields one aggregate sample per kind, and the counter starts again with the new kind. Queries see the change the way they see it in raw data: as a counter reset, and as a range that cannot be evaluated while it holds both kinds.
+
 ### ⚠ ️Downsampling: Note About Resolution and Retention ⚠️
 
 Resolution is a distance between data points on your graphs. E.g.
