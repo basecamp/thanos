@@ -202,8 +202,8 @@ func Downsample(
 			}
 		} else {
 			var (
-				previousIsHistogram bool
-				mint, maxt          int64
+				previousKind aggrChunkKind
+				mint, maxt   int64
 			)
 
 			fixedChks := make([]chunks.Meta, 0, len(chks))
@@ -240,10 +240,18 @@ func Downsample(
 				}
 			}
 
-			// Downsample a block that contains aggregated chunks already.
+			// Downsample a block that contains aggregated chunks already. Float
+			// chunks, exponential histogram chunks and custom buckets histogram
+			// chunks are downsampled as separate groups: a change of kind ends
+			// one group and starts the next, like the end of one series and the
+			// start of another, so nothing is ever aggregated across it.
 			for i, c := range fixedChks {
 				ac := c.Chunk.(*AggrChunk)
-				if i > 0 && previousIsHistogram != isHistogramAggrChunk(ac) {
+				kind, err := kindOfAggrChunk(ac)
+				if err != nil {
+					return id, errors.Wrapf(err, "get kind of chunk %d, series %d", c.Ref, postings.At())
+				}
+				if i > 0 && !kind.sameGroup(previousKind) {
 					err := downsampleAggr(
 						aggrChunks,
 						&all,
@@ -256,7 +264,7 @@ func Downsample(
 					if err != nil {
 						return id, errors.Wrapf(err, "downsample aggregate block, series: %d", postings.At())
 					}
-					previousIsHistogram = isHistogramAggrChunk(ac)
+					previousKind = kind
 					aggrChunks = aggrChunks[:0]
 					mint = c.MinTime
 				}
@@ -264,7 +272,10 @@ func Downsample(
 
 				if i == 0 {
 					mint = c.MinTime
-					previousIsHistogram = isHistogramAggrChunk(ac)
+					previousKind = kind
+				} else if previousKind == aggrChunkHistogramNoKind {
+					// The group had no histogram to take a kind from so far.
+					previousKind = kind
 				}
 				maxt = c.MaxTime
 			}
@@ -662,8 +673,8 @@ func planHistogramWindows(batch []sample, resolution int64) ([]histWindow, error
 // segmentHistogramWindows groups consecutive windows into maximal runs whose
 // emitted layouts are append-compatible: custom windows sharing one layout,
 // or exponential windows (whose schemas are unified per batch by minSchema).
-// A kind change between windows is rejected by planHistogramWindows already,
-// so runs only break on custom layout changes.
+// A batch holds one bucket kind (see histogramKindRuns), so in practice runs
+// only break on custom layout changes.
 func segmentHistogramWindows(wins []histWindow) [][]histWindow {
 	var segs [][]histWindow
 	var cur []histWindow
@@ -947,24 +958,82 @@ func DownsampleRaw(data []sample, resolution int64) ([]chunks.Meta, error) {
 		return nil, nil
 	}
 
+	// First sample determines the type of the samples, since we process
+	// one chunk and all samples of one chunk have the same type.
+	if data[0].fh == nil {
+		return downsampleRawRun(data, resolution, nil, downsampleFloatBatch)
+	}
+
+	// Prometheus cannot add or subtract exponential and custom buckets
+	// histograms, and one histogram chunk holds one of the two. A series that
+	// switches between them is therefore downsampled run by run, each run
+	// like a series of its own: its own batches, aggregates and chunks.
+	runs, err := histogramKindRuns(data)
+	if err != nil {
+		return nil, err
+	}
+	var chks []chunks.Meta
+	for _, run := range runs {
+		if chks, err = downsampleRawRun(run, resolution, chks, downsampleHistogramBatch); err != nil {
+			return nil, err
+		}
+	}
+	return chks, nil
+}
+
+// downsampleRawRun downsamples samples of one type (floats, or histograms of
+// one bucket kind) and appends the resulting aggregate chunks to chks.
+func downsampleRawRun(
+	data []sample,
+	resolution int64,
+	chks []chunks.Meta,
+	downsampleBatchFn func(batch []sample, resolution int64) ([]chunks.Meta, error),
+) ([]chunks.Meta, error) {
 	mint, maxt := data[0].t, data[len(data)-1].t
 	// We assume a raw resolution of 1 minute. In practice it will often be lower
 	// but this is sufficient for our heuristic to produce well-sized chunks.
 	numChunks := targetChunkCount(mint, maxt, 1*60*1000, resolution, len(data))
-	chks := make([]chunks.Meta, 0, numChunks)
+	chks = slices.Grow(chks, numChunks)
 
-	// First sample determines the type of the samples, since we process
-	// one chunk and all samples of one chunk have the same type.
-	var err error
-	if data[0].fh != nil {
-		err = downsampleRawLoop(data, resolution, numChunks, &chks, downsampleHistogramBatch)
-	} else {
-		err = downsampleRawLoop(data, resolution, numChunks, &chks, downsampleFloatBatch)
-	}
-	if err != nil {
+	if err := downsampleRawLoop(data, resolution, numChunks, &chks, downsampleBatchFn); err != nil {
 		return nil, err
 	}
 	return chks, nil
+}
+
+// histogramKindRuns splits the histogram samples of one series into maximal
+// runs of one bucket kind: exponential or custom buckets. The runs are
+// consecutive sub-slices of data that cover it completely, so a series that
+// never changes kind comes back as a single run, data itself.
+//
+// Samples that are not downsampled (a NaN sum, which includes stale markers)
+// have no kind: they never end a run and stay in the run they follow.
+func histogramKindRuns(data []sample) ([][]sample, error) {
+	var (
+		runs   [][]sample
+		start  int
+		seen   bool
+		custom bool
+		lastT  int64
+	)
+	for i, s := range data {
+		if s.fh == nil || math.IsNaN(s.fh.Sum) {
+			continue
+		}
+		if c := s.fh.UsesCustomBuckets(); !seen {
+			seen, custom = true, c
+		} else if c != custom {
+			// The chunks of the earlier run end at lastT and those of the
+			// later run start at s.t or after it.
+			if s.t <= lastT {
+				return nil, errors.Errorf("histogram bucket kind changes at timestamp %d, which is not after the previous sample at %d", s.t, lastT)
+			}
+			runs = append(runs, data[start:i])
+			start, custom = i, c
+		}
+		lastT = s.t
+	}
+	return append(runs, data[start:]), nil
 }
 
 func downsampleRawLoop(
@@ -1317,6 +1386,61 @@ func isHistogramAggrChunk(c *AggrChunk) bool {
 	return cntr.Encoding() == chunkenc.EncHistogram || cntr.Encoding() == chunkenc.EncFloatHistogram
 }
 
+// aggrChunkKind tells aggregate chunks apart that cannot be downsampled
+// together.
+type aggrChunkKind uint8
+
+const (
+	aggrChunkFloat aggrChunkKind = iota
+	// aggrChunkHistogramNoKind is a histogram chunk that holds no histogram
+	// to take a bucket kind from. It fits a histogram group of either kind.
+	aggrChunkHistogramNoKind
+	aggrChunkExponential
+	aggrChunkCustom
+)
+
+// sameGroup reports whether a chunk of kind k can be downsampled together
+// with a group of chunks of the given kind.
+func (k aggrChunkKind) sameGroup(group aggrChunkKind) bool {
+	if k == aggrChunkFloat || group == aggrChunkFloat {
+		return k == group
+	}
+	return k == group || k == aggrChunkHistogramNoKind || group == aggrChunkHistogramNoKind
+}
+
+// kindOfAggrChunk returns the kind of an aggregate chunk. A histogram chunk
+// cannot change bucket kind, so the kind of a histogram aggregate chunk is
+// that of its first counter histogram that is not a stale marker, or of its
+// first such sum histogram if the counter has none.
+func kindOfAggrChunk(c *AggrChunk) (aggrChunkKind, error) {
+	if !isHistogramAggrChunk(c) {
+		return aggrChunkFloat, nil
+	}
+	for _, at := range []AggrType{AggrCounter, AggrSum} {
+		chk, err := c.Get(at)
+		if err == ErrAggrNotExist {
+			continue
+		} else if err != nil {
+			return aggrChunkFloat, err
+		}
+		it := chk.Iterator(nil)
+		for vt := it.Next(); vt == chunkenc.ValFloatHistogram || vt == chunkenc.ValHistogram; vt = it.Next() {
+			_, fh := it.AtFloatHistogram(nil)
+			if value.IsStaleNaN(fh.Sum) {
+				continue
+			}
+			if fh.UsesCustomBuckets() {
+				return aggrChunkCustom, nil
+			}
+			return aggrChunkExponential, nil
+		}
+		if err := it.Err(); err != nil {
+			return aggrChunkFloat, err
+		}
+	}
+	return aggrChunkHistogramNoKind, nil
+}
+
 // downsampleAggr downsamples a sequence of aggregation chunks to the given resolution.
 func downsampleAggr(
 	chks []*AggrChunk,
@@ -1374,7 +1498,9 @@ func downsampleAggrLoop(
 	// counter values are the true values of the original series. We need
 	// to preserve them even across multiple aggregation iterations.
 	res := make([]chunks.Meta, 0, numChunks)
-	batchSize := len(chks) / numChunks
+	// At least one chunk per batch: with fewer chunks than target chunks the
+	// loop below would never consume anything.
+	batchSize := max(1, len(chks)/numChunks)
 
 	for len(chks) > 0 {
 		j := min(batchSize, len(chks))

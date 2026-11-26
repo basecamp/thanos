@@ -13,6 +13,8 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 ### Fixed
 
 - [#1](https://github.com/basecamp/thanos/pull/1) Compact: support downsampling native histograms with changing custom bucket layouts. Fixes panic `unexpected error: cannot apply this operation on custom buckets histograms with different custom bounds`.
+- [#4](https://github.com/basecamp/thanos/pull/4) Compact: support downsampling series that switch between exponential and custom buckets native histograms. A new aggregate chunk is started where the kind changes. Fixes error `mixed exponential and custom bucket histograms in window`.
+- [#4](https://github.com/basecamp/thanos/pull/4) Compact: fix downsampling never finishing for a series with fewer aggregate chunks than chunks targeted for the output.
 
 ### Added
 

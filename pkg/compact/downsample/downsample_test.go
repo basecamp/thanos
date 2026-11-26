@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -3270,8 +3269,9 @@ func TestDownsampleCustomBucketGaugeLayoutChange(t *testing.T) {
 }
 
 // TestDownsampleMixedBucketKinds verifies that a series switching from
-// exponential to custom bucket histograms is rejected instead of being
-// aggregated.
+// exponential to custom bucket histograms in the middle of a downsampling
+// window is cut into one aggregate chunk per kind, with the window split at
+// the switch and no sample lost.
 func TestDownsampleMixedBucketKinds(t *testing.T) {
 	var data []sample
 	for i := 0; i < 60; i++ {
@@ -3291,9 +3291,43 @@ func TestDownsampleMixedBucketKinds(t *testing.T) {
 			},
 		})
 	}
-	_, err := DownsampleRaw(data, ResLevel1)
-	testutil.NotOk(t, err)
-	testutil.Assert(t, strings.Contains(err.Error(), "mixed exponential and custom bucket histograms"), "unexpected error: %v", err)
+	chks, err := DownsampleRaw(data, ResLevel1)
+	testutil.Ok(t, err)
+	testutil.Equals(t, 2, len(chks))
+	testutil.Equals(t, len(data), nhcbTotalCount(t, chks))
+	assertOrderedUniqueTimestamps(t, chks)
+
+	// The exponential chunk ends with the three samples of the fifth window
+	// that precede the switch, stamped at the last of them.
+	expCounts := expandAggrChunk(t, chks[0], AggrCount)
+	testutil.Equals(t, 5, len(expCounts))
+	testutil.Equals(t, nhcbStart+22*nhcbStep, expCounts[4].t)
+	testutil.Equals(t, float64(3), expCounts[4].v)
+	testutil.Equals(t, nhcbStart+22*nhcbStep, chks[0].MaxTime)
+
+	// The custom chunk starts with the other two samples of that window,
+	// stamped at the window end.
+	customCounts := expandAggrChunk(t, chks[1], AggrCount)
+	testutil.Equals(t, 8, len(customCounts))
+	testutil.Equals(t, nhcbStart+25*nhcbStep-1, customCounts[0].t)
+	testutil.Equals(t, float64(2), customCounts[0].v)
+	testutil.Equals(t, nhcbStart+25*nhcbStep-1, chks[1].MinTime)
+
+	// Each chunk holds one kind, and the counter starts again with the
+	// custom chunk: no delta is taken across the switch.
+	for _, at := range []AggrType{AggrSum, AggrCounter} {
+		for _, s := range expandAggrChunk(t, chks[0], at) {
+			testutil.Assert(t, !s.fh.UsesCustomBuckets(), "custom histogram in the exponential %s chunk", at)
+		}
+		for _, s := range expandAggrChunk(t, chks[1], at) {
+			testutil.Assert(t, s.fh.UsesCustomBuckets(), "exponential histogram in the custom %s chunk", at)
+		}
+	}
+	expCounter := expandAggrChunk(t, chks[0], AggrCounter)
+	testutil.Equals(t, float64(2*23), expCounter[len(expCounter)-1].fh.Count)
+	customCounter := expandAggrChunk(t, chks[1], AggrCounter)
+	testutil.Equals(t, float64(4*25), customCounter[0].fh.Count)
+	testutil.Equals(t, float64(4*60), customCounter[len(customCounter)-1].fh.Count)
 }
 
 // TestDownsampleCustomBucketLayoutChangeResLevel2 verifies that chunks
